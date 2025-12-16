@@ -6,11 +6,92 @@ import crypto from 'crypto';
 import { getRequestBody } from './common.js';
 import { getAllProviderModels, getProviderModels } from './provider-models.js';
 import { CONFIG } from './config-manager.js';
-import { serviceInstances } from './adapter.js';
+import { serviceInstances, getServiceAdapter } from './adapter.js';
 import { initApiService } from './service-manager.js';
 import { handleGeminiCliOAuth, handleGeminiAntigravityOAuth, handleQwenOAuth } from './oauth-handlers.js';
+import {
+    generateUUID,
+    normalizePath,
+    getFileName,
+    pathsEqual,
+    isPathUsed,
+    detectProviderFromPath,
+    isValidOAuthCredentials,
+    createProviderConfig,
+    addToUsedPaths,
+    formatSystemPath
+} from './provider-utils.js';
+import { formatKiroUsage, formatGeminiUsage, formatAntigravityUsage } from './usage-service.js';
 
 // Tokenless/Stateless Authentication Logic
+
+// 用量缓存文件路径
+const USAGE_CACHE_FILE = 'usage-cache.json';
+
+/**
+ * 读取用量缓存文件
+ * @returns {Promise<Object|null>} 缓存的用量数据，如果不存在或读取失败则返回 null
+ */
+async function readUsageCache() {
+    try {
+        if (existsSync(USAGE_CACHE_FILE)) {
+            const content = await fs.readFile(USAGE_CACHE_FILE, 'utf8');
+            return JSON.parse(content);
+        }
+        return null;
+    } catch (error) {
+        console.warn('[Usage Cache] Failed to read usage cache:', error.message);
+        return null;
+    }
+}
+
+/**
+ * 写入用量缓存文件
+ * @param {Object} usageData - 用量数据
+ */
+async function writeUsageCache(usageData) {
+    try {
+        await fs.writeFile(USAGE_CACHE_FILE, JSON.stringify(usageData, null, 2), 'utf8');
+        console.log('[Usage Cache] Usage data cached to', USAGE_CACHE_FILE);
+    } catch (error) {
+        console.error('[Usage Cache] Failed to write usage cache:', error.message);
+    }
+}
+
+/**
+ * 读取特定提供商类型的用量缓存
+ * @param {string} providerType - 提供商类型
+ * @returns {Promise<Object|null>} 缓存的用量数据
+ */
+async function readProviderUsageCache(providerType) {
+    const cache = await readUsageCache();
+    if (cache && cache.providers && cache.providers[providerType]) {
+        return {
+            ...cache.providers[providerType],
+            cachedAt: cache.timestamp,
+            fromCache: true
+        };
+    }
+    return null;
+}
+
+/**
+ * 更新特定提供商类型的用量缓存
+ * @param {string} providerType - 提供商类型
+ * @param {Object} usageData - 用量数据
+ */
+async function updateProviderUsageCache(providerType, usageData) {
+    let cache = await readUsageCache();
+    if (!cache) {
+        cache = {
+            timestamp: new Date().toISOString(),
+            providers: {}
+        };
+    }
+    cache.providers[providerType] = usageData;
+    cache.timestamp = new Date().toISOString();
+    await writeUsageCache(cache);
+}
 
 /**
  * Generate a stateless token (Simple JWT-like structure: payload.signature)
@@ -404,6 +485,46 @@ export async function handleUIApiRequests(method, pathParam, req, res, currentCo
         return true;
     }
 
+    // Update admin password
+    if (method === 'POST' && pathParam === '/api/admin-password') {
+        try {
+            const body = await getRequestBody(req);
+            const { password } = body;
+
+            if (!password || password.trim() === '') {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({
+                    error: {
+                        message: '密码不能为空'
+                    }
+                }));
+                return true;
+            }
+
+            // 写入密码到 pwd 文件
+            const pwdFilePath = path.join(process.cwd(), 'pwd');
+            await fs.writeFile(pwdFilePath, password.trim(), 'utf8');
+            
+            console.log('[UI API] Admin password updated successfully');
+
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+                success: true,
+                message: '后台登录密码已更新'
+            }));
+            return true;
+        } catch (error) {
+            console.error('[UI API] Failed to update admin password:', error);
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+                error: {
+                    message: '更新密码失败: ' + error.message
+                }
+            }));
+            return true;
+        }
+    }
+
     // Get configuration
     if (method === 'GET' && pathParam === '/api/config') {
         let systemPrompt = '';
@@ -644,11 +765,7 @@ export async function handleUIApiRequests(method, pathParam, req, res, currentCo
 
             // Generate UUID if not provided
             if (!providerConfig.uuid) {
-                providerConfig.uuid = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
-                    const r = Math.random() * 16 | 0;
-                    const v = c == 'x' ? r : (r & 0x3 | 0x8);
-                    return v.toString(16);
-                });
+                providerConfig.uuid = generateUUID();
             }
 
             // Set default values
@@ -1029,6 +1146,118 @@ export async function handleUIApiRequests(method, pathParam, req, res, currentCo
         }
     }
 
+    // Perform health check for all providers of a specific type
+    const healthCheckMatch = pathParam.match(/^\/api\/providers\/([^\/]+)\/health-check$/);
+    if (method === 'POST' && healthCheckMatch) {
+        const providerType = decodeURIComponent(healthCheckMatch[1]);
+
+        try {
+            if (!providerPoolManager) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: { message: 'Provider pool manager not initialized' } }));
+                return true;
+            }
+
+            const providers = providerPoolManager.providerStatus[providerType] || [];
+            
+            if (providers.length === 0) {
+                res.writeHead(404, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: { message: 'No providers found for this type' } }));
+                return true;
+            }
+
+            console.log(`[UI API] Starting health check for ${providers.length} providers in ${providerType}`);
+
+            // 执行健康检测（强制检查，忽略 checkHealth 配置）
+            const results = [];
+            for (const providerStatus of providers) {
+                const providerConfig = providerStatus.config;
+                try {
+                    // 传递 forceCheck = true 强制执行健康检查，忽略 checkHealth 配置
+                    const healthResult = await providerPoolManager._checkProviderHealth(providerType, providerConfig, true);
+                    
+                    if (healthResult === null) {
+                        results.push({
+                            uuid: providerConfig.uuid,
+                            success: null,
+                            message: '健康检测不支持此提供商类型'
+                        });
+                        continue;
+                    }
+                    
+                    if (healthResult.success) {
+                        providerPoolManager.markProviderHealthy(providerType, providerConfig, false, healthResult.modelName);
+                        results.push({
+                            uuid: providerConfig.uuid,
+                            success: true,
+                            modelName: healthResult.modelName,
+                            message: '健康'
+                        });
+                    } else {
+                        providerPoolManager.markProviderUnhealthy(providerType, providerConfig, healthResult.errorMessage);
+                        providerStatus.config.lastHealthCheckTime = new Date().toISOString();
+                        if (healthResult.modelName) {
+                            providerStatus.config.lastHealthCheckModel = healthResult.modelName;
+                        }
+                        results.push({
+                            uuid: providerConfig.uuid,
+                            success: false,
+                            modelName: healthResult.modelName,
+                            message: healthResult.errorMessage || '检测失败'
+                        });
+                    }
+                } catch (error) {
+                    providerPoolManager.markProviderUnhealthy(providerType, providerConfig, error.message);
+                    results.push({
+                        uuid: providerConfig.uuid,
+                        success: false,
+                        message: error.message
+                    });
+                }
+            }
+
+            // 保存更新后的状态到文件
+            const filePath = currentConfig.PROVIDER_POOLS_FILE_PATH || 'provider_pools.json';
+            
+            // 从 providerStatus 构建 providerPools 对象并保存
+            const providerPools = {};
+            for (const pType in providerPoolManager.providerStatus) {
+                providerPools[pType] = providerPoolManager.providerStatus[pType].map(ps => ps.config);
+            }
+            writeFileSync(filePath, JSON.stringify(providerPools, null, 2), 'utf8');
+
+            const successCount = results.filter(r => r.success === true).length;
+            const failCount = results.filter(r => r.success === false).length;
+
+            console.log(`[UI API] Health check completed for ${providerType}: ${successCount} healthy, ${failCount} unhealthy`);
+
+            // 广播更新事件
+            broadcastEvent('config_update', {
+                action: 'health_check',
+                filePath: filePath,
+                providerType,
+                results,
+                timestamp: new Date().toISOString()
+            });
+
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+                success: true,
+                message: `健康检测完成: ${successCount} 个健康, ${failCount} 个异常`,
+                successCount,
+                failCount,
+                totalCount: providers.length,
+                results
+            }));
+            return true;
+        } catch (error) {
+            console.error('[UI API] Health check error:', error);
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: { message: error.message } }));
+            return true;
+        }
+    }
+
     // Generate OAuth authorization URL for providers
     const generateAuthUrlMatch = pathParam.match(/^\/api\/providers\/([^\/]+)\/generate-auth-url$/);
     if (method === 'POST' && generateAuthUrlMatch) {
@@ -1247,6 +1476,209 @@ export async function handleUIApiRequests(method, pathParam, req, res, currentCo
         }
     }
 
+    // Quick link config to corresponding provider based on directory
+    if (method === 'POST' && pathParam === '/api/quick-link-provider') {
+        try {
+            const body = await getRequestBody(req);
+            const { filePath } = body;
+
+            if (!filePath) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: { message: 'filePath is required' } }));
+                return true;
+            }
+
+            const normalizedPath = filePath.replace(/\\/g, '/').toLowerCase();
+            
+            // 根据文件路径自动识别提供商类型
+            const providerMapping = detectProviderFromPath(normalizedPath);
+            
+            if (!providerMapping) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({
+                    error: {
+                        message: '无法识别配置文件对应的提供商类型，请确保文件位于 configs/kiro/、configs/gemini/、configs/qwen/ 或 configs/antigravity/ 目录下'
+                    }
+                }));
+                return true;
+            }
+
+            const { providerType, credPathKey, defaultCheckModel, displayName } = providerMapping;
+            const poolsFilePath = currentConfig.PROVIDER_POOLS_FILE_PATH || 'provider_pools.json';
+            
+            // Load existing pools
+            let providerPools = {};
+            if (existsSync(poolsFilePath)) {
+                try {
+                    const fileContent = readFileSync(poolsFilePath, 'utf8');
+                    providerPools = JSON.parse(fileContent);
+                } catch (readError) {
+                    console.warn('[UI API] Failed to read existing provider pools:', readError.message);
+                }
+            }
+
+            // Ensure provider type array exists
+            if (!providerPools[providerType]) {
+                providerPools[providerType] = [];
+            }
+
+            // Check if already linked - 使用标准化路径进行比较
+            const normalizedForComparison = filePath.replace(/\\/g, '/');
+            const isAlreadyLinked = providerPools[providerType].some(p => {
+                const existingPath = p[credPathKey];
+                if (!existingPath) return false;
+                const normalizedExistingPath = existingPath.replace(/\\/g, '/');
+                return normalizedExistingPath === normalizedForComparison ||
+                       normalizedExistingPath === './' + normalizedForComparison ||
+                       './' + normalizedExistingPath === normalizedForComparison;
+            });
+
+            if (isAlreadyLinked) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: { message: '该配置文件已关联' } }));
+                return true;
+            }
+
+            // Create new provider config based on provider type
+            const newProvider = createProviderConfig({
+                credPathKey,
+                credPath: formatSystemPath(filePath),
+                defaultCheckModel,
+                needsProjectId: providerMapping.needsProjectId
+            });
+
+            providerPools[providerType].push(newProvider);
+
+            // Save to file
+            writeFileSync(poolsFilePath, JSON.stringify(providerPools, null, 2), 'utf8');
+            console.log(`[UI API] Quick linked config: ${filePath} -> ${providerType}`);
+
+            // Update provider pool manager if available
+            if (providerPoolManager) {
+                providerPoolManager.providerPools = providerPools;
+                providerPoolManager.initializeProviderStatus();
+            }
+
+            // Broadcast update event
+            broadcastEvent('config_update', {
+                action: 'quick_link',
+                filePath: poolsFilePath,
+                providerType,
+                newProvider,
+                timestamp: new Date().toISOString()
+            });
+
+            broadcastEvent('provider_update', {
+                action: 'add',
+                providerType,
+                providerConfig: newProvider,
+                timestamp: new Date().toISOString()
+            });
+
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+                success: true,
+                message: `配置已成功关联到 ${displayName}`,
+                provider: newProvider,
+                providerType: providerType
+            }));
+            return true;
+        } catch (error) {
+            console.error('[UI API] Quick link failed:', error);
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+                error: {
+                    message: '关联失败: ' + error.message
+                }
+            }));
+            return true;
+        }
+    }
+
+    // Get usage limits for all providers
+    if (method === 'GET' && pathParam === '/api/usage') {
+        try {
+            // 解析查询参数，检查是否需要强制刷新
+            const url = new URL(req.url, `http://${req.headers.host}`);
+            const refresh = url.searchParams.get('refresh') === 'true';
+            
+            let usageResults;
+            
+            if (!refresh) {
+                // 优先读取缓存
+                const cachedData = await readUsageCache();
+                if (cachedData) {
+                    console.log('[Usage API] Returning cached usage data');
+                    usageResults = { ...cachedData, fromCache: true };
+                }
+            }
+            
+            if (!usageResults) {
+                // 缓存不存在或需要刷新，重新查询
+                console.log('[Usage API] Fetching fresh usage data');
+                usageResults = await getAllProvidersUsage(currentConfig, providerPoolManager);
+                // 写入缓存
+                await writeUsageCache(usageResults);
+            }
+            
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify(usageResults));
+            return true;
+        } catch (error) {
+            console.error('[UI API] Failed to get usage:', error);
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+                error: {
+                    message: '获取用量信息失败: ' + error.message
+                }
+            }));
+            return true;
+        }
+    }
+
+    // Get usage limits for a specific provider type
+    const usageProviderMatch = pathParam.match(/^\/api\/usage\/([^\/]+)$/);
+    if (method === 'GET' && usageProviderMatch) {
+        const providerType = decodeURIComponent(usageProviderMatch[1]);
+        try {
+            // 解析查询参数，检查是否需要强制刷新
+            const url = new URL(req.url, `http://${req.headers.host}`);
+            const refresh = url.searchParams.get('refresh') === 'true';
+            
+            let usageResults;
+            
+            if (!refresh) {
+                // 优先读取缓存
+                const cachedData = await readProviderUsageCache(providerType);
+                if (cachedData) {
+                    console.log(`[Usage API] Returning cached usage data for ${providerType}`);
+                    usageResults = cachedData;
+                }
+            }
+            
+            if (!usageResults) {
+                // 缓存不存在或需要刷新，重新查询
+                console.log(`[Usage API] Fetching fresh usage data for ${providerType}`);
+                usageResults = await getProviderTypeUsage(providerType, currentConfig, providerPoolManager);
+                // 更新缓存
+                await updateProviderUsageCache(providerType, usageResults);
+            }
+            
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify(usageResults));
+            return true;
+        } catch (error) {
+            console.error(`[UI API] Failed to get usage for ${providerType}:`, error);
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+                error: {
+                    message: `获取 ${providerType} 用量信息失败: ` + error.message
+                }
+            }));
+            return true;
+        }
+    }
+
     // Reload configuration files
     if (method === 'POST' && pathParam === '/api/reload-config') {
         try {
@@ -1369,30 +1801,9 @@ async function scanConfigFiles(currentConfig, providerPoolManager) {
     const usedPaths = new Set(); // 存储已使用的路径，用于判断关联状态
 
     // 从配置中提取所有OAuth凭据文件路径 - 标准化路径格式
-    if (currentConfig.GEMINI_OAUTH_CREDS_FILE_PATH) {
-        const normalizedPath = currentConfig.GEMINI_OAUTH_CREDS_FILE_PATH.replace(/\\/g, '/');
-        usedPaths.add(currentConfig.GEMINI_OAUTH_CREDS_FILE_PATH);
-        usedPaths.add(normalizedPath);
-        if (normalizedPath.startsWith('./')) {
-            usedPaths.add(normalizedPath.slice(2));
-        }
-    }
-    if (currentConfig.KIRO_OAUTH_CREDS_FILE_PATH) {
-        const normalizedPath = currentConfig.KIRO_OAUTH_CREDS_FILE_PATH.replace(/\\/g, '/');
-        usedPaths.add(currentConfig.KIRO_OAUTH_CREDS_FILE_PATH);
-        usedPaths.add(normalizedPath);
-        if (normalizedPath.startsWith('./')) {
-            usedPaths.add(normalizedPath.slice(2));
-        }
-    }
-    if (currentConfig.QWEN_OAUTH_CREDS_FILE_PATH) {
-        const normalizedPath = currentConfig.QWEN_OAUTH_CREDS_FILE_PATH.replace(/\\/g, '/');
-        usedPaths.add(currentConfig.QWEN_OAUTH_CREDS_FILE_PATH);
-        usedPaths.add(normalizedPath);
-        if (normalizedPath.startsWith('./')) {
-            usedPaths.add(normalizedPath.slice(2));
-        }
-    }
+    addToUsedPaths(usedPaths, currentConfig.GEMINI_OAUTH_CREDS_FILE_PATH);
+    addToUsedPaths(usedPaths, currentConfig.KIRO_OAUTH_CREDS_FILE_PATH);
+    addToUsedPaths(usedPaths, currentConfig.QWEN_OAUTH_CREDS_FILE_PATH);
 
     // 使用最新的提供商池数据
     let providerPools = currentConfig.providerPools;
@@ -1404,30 +1815,10 @@ async function scanConfigFiles(currentConfig, providerPoolManager) {
     if (providerPools) {
         for (const [providerType, providers] of Object.entries(providerPools)) {
             for (const provider of providers) {
-                if (provider.GEMINI_OAUTH_CREDS_FILE_PATH) {
-                    const normalizedPath = provider.GEMINI_OAUTH_CREDS_FILE_PATH.replace(/\\/g, '/');
-                    usedPaths.add(provider.GEMINI_OAUTH_CREDS_FILE_PATH);
-                    usedPaths.add(normalizedPath);
-                    if (normalizedPath.startsWith('./')) {
-                        usedPaths.add(normalizedPath.slice(2));
-                    }
-                }
-                if (provider.KIRO_OAUTH_CREDS_FILE_PATH) {
-                    const normalizedPath = provider.KIRO_OAUTH_CREDS_FILE_PATH.replace(/\\/g, '/');
-                    usedPaths.add(provider.KIRO_OAUTH_CREDS_FILE_PATH);
-                    usedPaths.add(normalizedPath);
-                    if (normalizedPath.startsWith('./')) {
-                        usedPaths.add(normalizedPath.slice(2));
-                    }
-                }
-                if (provider.QWEN_OAUTH_CREDS_FILE_PATH) {
-                    const normalizedPath = provider.QWEN_OAUTH_CREDS_FILE_PATH.replace(/\\/g, '/');
-                    usedPaths.add(provider.QWEN_OAUTH_CREDS_FILE_PATH);
-                    usedPaths.add(normalizedPath);
-                    if (normalizedPath.startsWith('./')) {
-                        usedPaths.add(normalizedPath.slice(2));
-                    }
-                }
+                addToUsedPaths(usedPaths, provider.GEMINI_OAUTH_CREDS_FILE_PATH);
+                addToUsedPaths(usedPaths, provider.KIRO_OAUTH_CREDS_FILE_PATH);
+                addToUsedPaths(usedPaths, provider.QWEN_OAUTH_CREDS_FILE_PATH);
+                addToUsedPaths(usedPaths, provider.ANTIGRAVITY_OAUTH_CREDS_FILE_PATH);
             }
         }
     }
@@ -1634,6 +2025,17 @@ function getFileUsageInfo(relativePath, fileName, usedPaths, currentConfig) {
                 });
             }
 
+            if (provider.ANTIGRAVITY_OAUTH_CREDS_FILE_PATH &&
+                (pathsEqual(relativePath, provider.ANTIGRAVITY_OAUTH_CREDS_FILE_PATH) ||
+                 pathsEqual(relativePath, provider.ANTIGRAVITY_OAUTH_CREDS_FILE_PATH.replace(/\\/g, '/')))) {
+                providerUsages.push({
+                    type: '提供商池',
+                    location: `Antigravity OAuth凭据 (节点${index + 1})`,
+                    providerType: providerType,
+                    providerIndex: index,
+                    configKey: 'ANTIGRAVITY_OAUTH_CREDS_FILE_PATH'
+                });
+            }
             if (providerUsages.length > 0) {
                 usageInfo.usageType = 'provider_pool';
                 usageInfo.usageDetails.push(...providerUsages);
@@ -1692,131 +2094,199 @@ async function scanOAuthDirectory(dirPath, usedPaths, currentConfig) {
 }
 
 
-/**
- * Normalize a path for cross-platform compatibility
- * @param {string} filePath - The file path to normalize
- * @returns {string} Normalized path using forward slashes
- */
-function normalizePath(filePath) {
-    if (!filePath) return filePath;
+// 注意：normalizePath, getFileName, pathsEqual, isPathUsed, detectProviderFromPath
+// 已移至 provider-utils.js 公共模块
 
-    // Use path module to normalize and then convert to forward slashes
-    const normalized = path.normalize(filePath);
-    return normalized.replace(/\\/g, '/');
-}
 
 /**
- * Extract filename from any path format
- * @param {string} filePath - The file path
- * @returns {string} Filename
+ * 获取所有支持用量查询的提供商的用量信息
+ * @param {Object} currentConfig - 当前配置
+ * @param {Object} providerPoolManager - 提供商池管理器
+ * @returns {Promise<Object>} 所有提供商的用量信息
  */
-function getFileName(filePath) {
-    return path.basename(filePath);
-}
+async function getAllProvidersUsage(currentConfig, providerPoolManager) {
+    const results = {
+        timestamp: new Date().toISOString(),
+        providers: {}
+    };
 
-/**
- * Check if two paths refer to the same file (cross-platform compatible)
- * @param {string} path1 - First path
- * @param {string} path2 - Second path
- * @returns {boolean} True if paths refer to same file
- */
-function pathsEqual(path1, path2) {
-    if (!path1 || !path2) return false;
+    // 支持用量查询的提供商列表
+    const supportedProviders = ['claude-kiro-oauth', 'gemini-cli-oauth', 'gemini-antigravity'];
 
-    try {
-        // Normalize both paths
-        const normalized1 = normalizePath(path1);
-        const normalized2 = normalizePath(path2);
-
-        // Direct match
-        if (normalized1 === normalized2) {
-            return true;
-        }
-
-        // Remove leading './' if present
-        const clean1 = normalized1.replace(/^\.\//, '');
-        const clean2 = normalized2.replace(/^\.\//, '');
-
-        if (clean1 === clean2) {
-            return true;
-        }
-
-        // Check if one is a subset of the other (for relative vs absolute)
-        if (normalized1.endsWith('/' + clean2) || normalized2.endsWith('/' + clean1)) {
-            return true;
-        }
-
-        return false;
-    } catch (error) {
-        console.warn(`[Path Comparison] Error comparing paths: ${path1} vs ${path2}`, error.message);
-        return false;
-    }
-}
-
-/**
- * Check if a file path is being used (cross-platform compatible)
- * @param {string} relativePath - Relative path
- * @param {string} fileName - File name
- * @param {Set} usedPaths - Set of used paths
- * @returns {boolean} True if the file is being used
- */
-function isPathUsed(relativePath, fileName, usedPaths) {
-    if (!relativePath) return false;
-
-    // Normalize the relative path
-    const normalizedRelativePath = normalizePath(relativePath);
-    const cleanRelativePath = normalizedRelativePath.replace(/^\.\//, '');
-
-    // Get the filename from relative path
-    const relativeFileName = getFileName(normalizedRelativePath);
-
-    // 遍历所有已使用路径进行匹配
-    for (const usedPath of usedPaths) {
-        if (!usedPath) continue;
-
-        // 1. 直接路径匹配
-        if (pathsEqual(relativePath, usedPath) || pathsEqual(relativePath, './' + usedPath)) {
-            return true;
-        }
-
-        // 2. 标准化路径匹配
-        if (pathsEqual(normalizedRelativePath, usedPath) ||
-            pathsEqual(normalizedRelativePath, './' + usedPath)) {
-            return true;
-        }
-
-        // 3. 清理后的路径匹配
-        if (pathsEqual(cleanRelativePath, usedPath) ||
-            pathsEqual(cleanRelativePath, './' + usedPath)) {
-            return true;
-        }
-
-        // 4. 文件名匹配（确保不是误匹配）
-        const usedFileName = getFileName(usedPath);
-        if (usedFileName === fileName || usedFileName === relativeFileName) {
-            // 确保是同一个目录下的文件
-            const usedDir = path.dirname(usedPath);
-            const relativeDir = path.dirname(normalizedRelativePath);
-
-            if (pathsEqual(usedDir, relativeDir) ||
-                pathsEqual(usedDir, cleanRelativePath.replace(/\/[^\/]+$/, '')) ||
-                pathsEqual(relativeDir.replace(/^\.\//, ''), usedDir.replace(/^\.\//, ''))) {
-                return true;
-            }
-        }
-
-        // 5. 绝对路径匹配（Windows和Unix）
+    // 并发获取所有提供商的用量数据
+    const usagePromises = supportedProviders.map(async (providerType) => {
         try {
-            const resolvedUsedPath = path.resolve(usedPath);
-            const resolvedRelativePath = path.resolve(relativePath);
-
-            if (resolvedUsedPath === resolvedRelativePath) {
-                return true;
-            }
+            const providerUsage = await getProviderTypeUsage(providerType, currentConfig, providerPoolManager);
+            return { providerType, data: providerUsage, success: true };
         } catch (error) {
-            // Ignore path resolution errors
+            return {
+                providerType,
+                data: {
+                    error: error.message,
+                    instances: []
+                },
+                success: false
+            };
         }
+    });
+
+    // 等待所有并发请求完成
+    const usageResults = await Promise.all(usagePromises);
+
+    // 将结果整合到 results.providers 中
+    for (const result of usageResults) {
+        results.providers[result.providerType] = result.data;
     }
 
-    return false;
+    return results;
+}
+
+/**
+ * 获取指定提供商类型的用量信息
+ * @param {string} providerType - 提供商类型
+ * @param {Object} currentConfig - 当前配置
+ * @param {Object} providerPoolManager - 提供商池管理器
+ * @returns {Promise<Object>} 提供商用量信息
+ */
+async function getProviderTypeUsage(providerType, currentConfig, providerPoolManager) {
+    const result = {
+        providerType,
+        instances: [],
+        totalCount: 0,
+        successCount: 0,
+        errorCount: 0
+    };
+
+    // 获取提供商池中的所有实例
+    let providers = [];
+    if (providerPoolManager && providerPoolManager.providerPools && providerPoolManager.providerPools[providerType]) {
+        providers = providerPoolManager.providerPools[providerType];
+    } else if (currentConfig.providerPools && currentConfig.providerPools[providerType]) {
+        providers = currentConfig.providerPools[providerType];
+    }
+
+    result.totalCount = providers.length;
+
+    // 遍历所有提供商实例获取用量
+    for (const provider of providers) {
+        const providerKey = providerType + (provider.uuid || '');
+        let adapter = serviceInstances[providerKey];
+        
+        const instanceResult = {
+            uuid: provider.uuid || 'unknown',
+            name: getProviderDisplayName(provider, providerType),
+            isHealthy: provider.isHealthy !== false,
+            isDisabled: provider.isDisabled === true,
+            success: false,
+            usage: null,
+            error: null
+        };
+
+        // 首先检查是否已禁用，已禁用的提供商跳过初始化
+        if (provider.isDisabled) {
+            instanceResult.error = '提供商已禁用';
+            result.errorCount++;
+        } else if (!adapter) {
+            // 服务实例未初始化，尝试自动初始化
+            try {
+                console.log(`[Usage API] Auto-initializing service adapter for ${providerType}: ${provider.uuid}`);
+                // 构建配置对象
+                const serviceConfig = {
+                    ...CONFIG,
+                    ...provider,
+                    MODEL_PROVIDER: providerType
+                };
+                adapter = getServiceAdapter(serviceConfig);
+            } catch (initError) {
+                console.error(`[Usage API] Failed to initialize adapter for ${providerType}: ${provider.uuid}:`, initError.message);
+                instanceResult.error = `服务实例初始化失败: ${initError.message}`;
+                result.errorCount++;
+            }
+        }
+        
+        // 如果适配器存在（包括刚初始化的），且没有错误，尝试获取用量
+        if (adapter && !instanceResult.error) {
+            try {
+                const usage = await getAdapterUsage(adapter, providerType);
+                instanceResult.success = true;
+                instanceResult.usage = usage;
+                result.successCount++;
+            } catch (error) {
+                instanceResult.error = error.message;
+                result.errorCount++;
+            }
+        }
+
+        result.instances.push(instanceResult);
+    }
+
+    return result;
+}
+
+/**
+ * 从适配器获取用量信息
+ * @param {Object} adapter - 服务适配器
+ * @param {string} providerType - 提供商类型
+ * @returns {Promise<Object>} 用量信息
+ */
+async function getAdapterUsage(adapter, providerType) {
+    if (providerType === 'claude-kiro-oauth') {
+        if (typeof adapter.getUsageLimits === 'function') {
+            const rawUsage = await adapter.getUsageLimits();
+            return formatKiroUsage(rawUsage);
+        } else if (adapter.kiroApiService && typeof adapter.kiroApiService.getUsageLimits === 'function') {
+            const rawUsage = await adapter.kiroApiService.getUsageLimits();
+            return formatKiroUsage(rawUsage);
+        }
+        throw new Error('该适配器不支持用量查询');
+    }
+
+    if (providerType === 'gemini-cli-oauth') {
+        if (typeof adapter.getUsageLimits === 'function') {
+            const rawUsage = await adapter.getUsageLimits();
+            return formatGeminiUsage(rawUsage);
+        } else if (adapter.geminiApiService && typeof adapter.geminiApiService.getUsageLimits === 'function') {
+            const rawUsage = await adapter.geminiApiService.getUsageLimits();
+            return formatGeminiUsage(rawUsage);
+        }
+        throw new Error('该适配器不支持用量查询');
+    }
+    
+    if (providerType === 'gemini-antigravity') {
+        if (typeof adapter.getUsageLimits === 'function') {
+            const rawUsage = await adapter.getUsageLimits();
+            return formatAntigravityUsage(rawUsage);
+        } else if (adapter.antigravityApiService && typeof adapter.antigravityApiService.getUsageLimits === 'function') {
+            const rawUsage = await adapter.antigravityApiService.getUsageLimits();
+            return formatAntigravityUsage(rawUsage);
+        }
+        throw new Error('该适配器不支持用量查询');
+    }
+    
+    throw new Error(`不支持的提供商类型: ${providerType}`);
+}
+
+/**
+ * 获取提供商显示名称
+ * @param {Object} provider - 提供商配置
+ * @param {string} providerType - 提供商类型
+ * @returns {string} 显示名称
+ */
+function getProviderDisplayName(provider, providerType) {
+    // 尝试从凭据文件路径提取名称
+    const credPathKey = {
+        'claude-kiro-oauth': 'KIRO_OAUTH_CREDS_FILE_PATH',
+        'gemini-cli-oauth': 'GEMINI_OAUTH_CREDS_FILE_PATH',
+        'gemini-antigravity': 'ANTIGRAVITY_OAUTH_CREDS_FILE_PATH',
+        'openai-qwen-oauth': 'QWEN_OAUTH_CREDS_FILE_PATH'
+    }[providerType];
+
+    if (credPathKey && provider[credPathKey]) {
+        const filePath = provider[credPathKey];
+        const fileName = path.basename(filePath);
+        const dirName = path.basename(path.dirname(filePath));
+        return `${dirName}/${fileName}`;
+    }
+
+    return provider.uuid || '未命名';
 }

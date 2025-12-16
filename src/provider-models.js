@@ -18,18 +18,17 @@ export const PROVIDER_MODELS = {
         'gemini-3-pro-preview',
         'gemini-claude-sonnet-4-5',
         'gemini-claude-sonnet-4-5-thinking',
-        'gemini-2.5-flash'
+        'gemini-claude-opus-4-5-thinking'
     ],
     'claude-custom': [],
     'claude-kiro-oauth': [
         'claude-opus-4-5',
+        'claude-opus-4-5-20251101',
         'claude-haiku-4-5',
         'claude-sonnet-4-5',
         'claude-sonnet-4-5-20250929',
         'claude-sonnet-4-20250514',
-        'claude-3-7-sonnet-20250219',
-        'amazonq-claude-sonnet-4-20250514',
-        'amazonq-claude-3-7-sonnet-20250219'
+        'claude-3-7-sonnet-20250219'
     ],
     'openai-custom': [],
     'openaiResponses-custom': [],

@@ -48,6 +48,9 @@
                     <a href="#upload-config" class="nav-item" data-section="upload-config" aria-label="上传配置管理">
                         <i class="fas fa-upload" aria-hidden="true"></i> <span>上传配置管理</span>
                     </a>
+                    <a href="#usage" class="nav-item" data-section="usage" aria-label="用量查询">
+                        <i class="fas fa-chart-bar" aria-hidden="true"></i> <span>用量查询</span>
+                    </a>
                     <a href="#logs" class="nav-item" data-section="logs" aria-label="实时日志">
                         <i class="fas fa-file-alt" aria-hidden="true"></i> <span>实时日志</span>
                     </a>
@@ -711,6 +714,18 @@
                                     <label for="systemPrompt">系统提示</label>
                                     <textarea id="systemPrompt" class="form-control" rows="4" placeholder="输入系统提示..."></textarea>
                                 </div>
+                                
+                                <!-- 后台登录密码配置 -->
+                                <div class="form-group pool-section">
+                                    <label for="adminPassword">后台登录密码</label>
+                                    <div class="password-input-wrapper">
+                                        <input type="password" id="adminPassword" class="form-control" placeholder="设置后台登录密码（留空则不修改）" autocomplete="new-password">
+                                        <button type="button" class="password-toggle" data-target="adminPassword" aria-label="显示/隐藏密码">
+                                            <i class="fas fa-eye" aria-hidden="true"></i>
+                                        </button>
+                                    </div>
+                                    <small class="form-text">用于保护管理控制台的访问，修改后需要重新登录</small>
+                                </div>
                             </div>
                             
                             <div class="form-actions">
@@ -768,6 +783,9 @@
                                     <span id="configCount">共 0 个配置文件</span>
                                     <span id="usedConfigCount" class="status-used">已关联: 0</span>
                                     <span id="unusedConfigCount" class="status-unused">未关联: 0</span>
+                                    <button id="batchLinkKiroBtn" class="btn-batch-link-kiro" title="批量关联 configs/ 下的未关联配置">
+                                        <i class="fas fa-link"></i> 自动关联oauth
+                                    </button>
                                 </div>
                             </div>
                             <div id="configList" class="config-list">
@@ -819,6 +837,36 @@
                     <div class="providers-container">
                         <div id="providersList" class="providers-list">
                             <!-- Providers will be loaded here -->
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Usage Section -->
+                <section id="usage" class="section" aria-labelledby="usage-title">
+                    <h2 id="usage-title">用量查询</h2>
+                    <div class="usage-panel">
+                        <div class="usage-controls">
+                            <button class="btn btn-primary" id="refreshUsageBtn" aria-label="刷新用量数据">
+                                <i class="fas fa-sync-alt"></i> 刷新用量
+                            </button>
+                            <span class="usage-last-update" id="usageLastUpdate">上次更新: --</span>
+                        </div>
+                        
+                        <div class="usage-loading" id="usageLoading" style="display: none;">
+                            <i class="fas fa-spinner fa-spin"></i> 正在加载用量数据...
+                        </div>
+                        
+                        <div class="usage-error" id="usageError" style="display: none;">
+                            <i class="fas fa-exclamation-triangle"></i>
+                            <span id="usageErrorMessage"></span>
+                        </div>
+                        
+                        <div class="usage-content" id="usageContent">
+                            <!-- 用量数据将在这里动态生成 -->
+                            <div class="usage-empty" id="usageEmpty">
+                                <i class="fas fa-chart-bar"></i>
+                                <p>点击"刷新用量"按钮获取授权文件用量信息</p>
+                            </div>
                         </div>
                     </div>
                 </section>
